@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: certmanager
+      POSTGRES_USER: certmanager
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-development-password}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck: {test: [CMD-SHELL, "pg_isready -U certmanager"], interval: 5s, timeout: 5s, retries: 10}
+  web:
+    build: .
+    ports: ["8080:8080"]
+    depends_on: {postgres: {condition: service_healthy}}
+    environment:
+      ConnectionStrings__Database: Host=postgres;Port=5432;Database=certmanager;Username=certmanager;Password=${POSTGRES_PASSWORD:-local-development-password}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-ChangeMe!123456}
+      ASPNETCORE_FORWARDEDHEADERS_ENABLED: "true"
+volumes: {postgres-data: {}}
