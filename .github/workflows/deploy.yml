@@ -1,15 +1,78 @@
 name: Deploy Azure
-on: {workflow_dispatch: {inputs: {environment: {description: Environment, required: true, default: dev, type: choice, options: [dev, test, prod]}}}, push: {branches: [main]}}
-permissions: {id-token: write, contents: read}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment
+        required: true
+        default: dev
+        type: choice
+        options: [dev, test, prod]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  # Never race infrastructure, migrations, or image activation in the same environment.
+  group: certmanager-${{ inputs.environment }}
+  cancel-in-progress: false
+
 jobs:
-  deploy:
-    environment: ${{ inputs.environment || 'prod' }}
+  verify-and-deploy:
+    environment: ${{ inputs.environment }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Verify frontend
+        working-directory: src/CertificateManager.Web
+        run: npm install && npm run lint && npm run build
+      - name: Verify backend
+        run: >-
+          dotnet restore &&
+          dotnet build --no-restore -c Release &&
+          dotnet test --no-build -c Release &&
+          dotnet tool restore &&
+          dotnet ef migrations script --idempotent --no-build -c Release
+          --project src/CertificateManager.Infrastructure
+          --startup-project src/CertificateManager.Api
+          --output ${{ runner.temp }}/certmanager-migrations.sql
       - uses: azure/login@v2
-        with: {client-id: "${{ vars.AZURE_CLIENT_ID }}", tenant-id: "${{ vars.AZURE_TENANT_ID }}", subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}"}
-      - uses: azure/cli@v2
-        with: {inlineScript: "az group create -n ${{ vars.AZURE_RESOURCE_GROUP }} -l ${{ vars.AZURE_LOCATION }} && az deployment group create -g ${{ vars.AZURE_RESOURCE_GROUP }} -f infrastructure/bicep/main.bicep -p environmentName=${{ inputs.environment || 'prod' }} postgresAdminLogin=${{ vars.POSTGRES_ADMIN_LOGIN }} postgresAdminPassword='${{ secrets.POSTGRES_ADMIN_PASSWORD }}' imageTag=${{ github.sha }}"}
-      - run: az acr login -n ${{ vars.AZURE_ACR_NAME }} && docker build -t ${{ vars.AZURE_ACR_NAME }}.azurecr.io/certmanager:${{ github.sha }} . && docker push ${{ vars.AZURE_ACR_NAME }}.azurecr.io/certmanager:${{ github.sha }}
-      - run: az webapp config container set -g ${{ vars.AZURE_RESOURCE_GROUP }} -n ${{ vars.AZURE_WEBAPP_NAME }} --docker-custom-image-name ${{ vars.AZURE_ACR_NAME }}.azurecr.io/certmanager:${{ github.sha }}
+        # GitHub OIDC avoids a long-lived Azure client secret.
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Validate infrastructure template
+        run: az bicep build --file infrastructure/bicep/main.bicep
+      - name: Provision infrastructure
+        env:
+          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+          SEED_ADMIN_PASSWORD: ${{ secrets.SEED_ADMIN_PASSWORD }}
+        run: >-
+          az group create -n "${{ vars.AZURE_RESOURCE_GROUP }}" -l "${{ vars.AZURE_LOCATION }}" &&
+          az deployment group create -g "${{ vars.AZURE_RESOURCE_GROUP }}"
+          -f infrastructure/bicep/main.bicep
+          -p environmentName="${{ inputs.environment }}"
+          postgresAdminLogin="${{ vars.POSTGRES_ADMIN_LOGIN }}"
+          postgresAdminPassword="$POSTGRES_ADMIN_PASSWORD"
+          seedAdminPassword="$SEED_ADMIN_PASSWORD"
+          imageTag="${{ github.sha }}"
+      - name: Build and push immutable image
+        # Commit-SHA tags make rollback and provenance unambiguous.
+        run: >-
+          az acr login -n "${{ vars.AZURE_ACR_NAME }}" &&
+          docker build -t "${{ vars.AZURE_ACR_NAME }}.azurecr.io/certmanager:${{ github.sha }}" . &&
+          docker push "${{ vars.AZURE_ACR_NAME }}.azurecr.io/certmanager:${{ github.sha }}"
+      - name: Activate image
+        run: >-
+          az webapp config container set -g "${{ vars.AZURE_RESOURCE_GROUP }}"
+          -n "${{ vars.AZURE_WEBAPP_NAME }}"
+          --docker-custom-image-name "${{ vars.AZURE_ACR_NAME }}.azurecr.io/certmanager:${{ github.sha }}"
