@@ -1,18 +1,53 @@
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: certmanager
       POSTGRES_USER: certmanager
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-development-password}
-    volumes: [postgres-data:/var/lib/postgresql/data]
-    healthcheck: {test: [CMD-SHELL, "pg_isready -U certmanager"], interval: 5s, timeout: 5s, retries: 10}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U certmanager -d certmanager"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
   web:
-    build: .
-    ports: ["8080:8080"]
-    depends_on: {postgres: {condition: service_healthy}}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8080/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
       ConnectionStrings__Database: Host=postgres;Port=5432;Database=certmanager;Username=certmanager;Password=${POSTGRES_PASSWORD:-local-development-password}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-ChangeMe!123456}
-      ASPNETCORE_FORWARDEDHEADERS_ENABLED: "true"
-volumes: {postgres-data: {}}
+      SEED_ADMIN_RESET_PASSWORD: ${SEED_ADMIN_RESET_PASSWORD:-false}
+      Authentication__Microsoft__Enabled: ${MICROSOFT_AUTH_ENABLED:-false}
+      Authentication__Microsoft__TenantId: ${MICROSOFT_TENANT_ID:-}
+      Authentication__Microsoft__ClientId: ${MICROSOFT_CLIENT_ID:-}
+      Authentication__Microsoft__ClientSecret: ${MICROSOFT_CLIENT_SECRET:-}
+      Authentication__Microsoft__CallbackPath: ${MICROSOFT_CALLBACK_PATH:-/signin-microsoft}
+      Notifications__Enabled: ${NOTIFICATIONS_ENABLED:-false}
+      ForwardedHeaders__TrustAll: "false"
+      AllowedHosts: ${ALLOWED_HOSTS:-localhost;127.0.0.1}
+    volumes:
+      - web-keys:/app/keys
+
+volumes:
+  postgres-data:
+  web-keys:

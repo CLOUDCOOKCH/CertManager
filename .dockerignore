@@ -3,5 +3,7 @@
 **/obj
 **/node_modules
 **/dist
+**/wwwroot
+**/*.tsbuildinfo
 *.pfx
 *.cer
